@@ -6,14 +6,18 @@
  * Phase 3: validate sub-command implementation using WasmEdge C API
  * Phase 4: instantiate sub-command implementation using WasmEdge C API
  * Phase 5: Production-quality error handling, exit codes, and resource discipline
+ * Phase 6: File validation, RAII wrappers, and verbose mode
  */
 
 #include <iostream>
 #include <string>
 #include <string_view>
-#include <cstdlib>
+#include <memory>
+#include <filesystem>
 
 #include <wasmedge/wasmedge.h>
+
+namespace fs = std::filesystem;
 
 // ============================================================================
 // Exit Codes (consistent across all commands)
@@ -21,6 +25,59 @@
 constexpr int EXIT_OK = 0;           // Success
 constexpr int EXIT_CLI_ERROR = 1;    // CLI / user input error (wrong arguments, unknown command)
 constexpr int EXIT_RUNTIME_ERROR = 2; // WasmEdge runtime error (parse, validate, instantiate failure)
+
+// ============================================================================
+// Global State
+// ============================================================================
+bool g_verbose = false;  // Verbose mode flag
+
+// ============================================================================
+// RAII Wrappers for WasmEdge C Contexts
+// ============================================================================
+
+/**
+ * RAII wrapper for WasmEdge_ParserContext
+ * Automatically calls WasmEdge_ParserDelete on destruction
+ */
+struct ParserDeleter {
+    void operator()(WasmEdge_ParserContext* ctx) const {
+        if (ctx) WasmEdge_ParserDelete(ctx);
+    }
+};
+using ParserPtr = std::unique_ptr<WasmEdge_ParserContext, ParserDeleter>;
+
+/**
+ * RAII wrapper for WasmEdge_ValidatorContext
+ * Automatically calls WasmEdge_ValidatorDelete on destruction
+ */
+struct ValidatorDeleter {
+    void operator()(WasmEdge_ValidatorContext* ctx) const {
+        if (ctx) WasmEdge_ValidatorDelete(ctx);
+    }
+};
+using ValidatorPtr = std::unique_ptr<WasmEdge_ValidatorContext, ValidatorDeleter>;
+
+/**
+ * RAII wrapper for WasmEdge_ASTModuleContext
+ * Automatically calls WasmEdge_ASTModuleDelete on destruction
+ */
+struct ASTModuleDeleter {
+    void operator()(WasmEdge_ASTModuleContext* ctx) const {
+        if (ctx) WasmEdge_ASTModuleDelete(ctx);
+    }
+};
+using ASTModulePtr = std::unique_ptr<WasmEdge_ASTModuleContext, ASTModuleDeleter>;
+
+/**
+ * RAII wrapper for WasmEdge_VMContext
+ * Automatically calls WasmEdge_VMDelete on destruction
+ */
+struct VMDeleter {
+    void operator()(WasmEdge_VMContext* ctx) const {
+        if (ctx) WasmEdge_VMDelete(ctx);
+    }
+};
+using VMPtr = std::unique_ptr<WasmEdge_VMContext, VMDeleter>;
 
 // ============================================================================
 // Program Metadata
@@ -36,7 +93,7 @@ constexpr std::string_view VERSION = "0.1.0";
  * Print program usage information
  */
 void printUsage() {
-    std::cout << "Usage: " << PROGRAM_NAME << " <command> <file.wasm>\n"
+    std::cout << "Usage: " << PROGRAM_NAME << " [options] <command> <file.wasm>\n"
               << "\n"
               << "A mini CLI tool mirroring WasmEdge CLI sub-commands.\n"
               << "\n"
@@ -48,11 +105,12 @@ void printUsage() {
               << "Options:\n"
               << "  -h, --help     Show this help message\n"
               << "  -v, --version  Show version information\n"
+              << "  --verbose      Enable verbose output\n"
               << "\n"
               << "Examples:\n"
               << "  " << PROGRAM_NAME << " parse example.wasm\n"
               << "  " << PROGRAM_NAME << " validate example.wasm\n"
-              << "  " << PROGRAM_NAME << " instantiate example.wasm\n";
+              << "  " << PROGRAM_NAME << " --verbose instantiate example.wasm\n";
 }
 
 /**
@@ -123,6 +181,61 @@ void printSuccess(std::string_view command, std::string_view filename,
               << "Status : " << status << "\n";
 }
 
+/**
+ * Print verbose information (only when --verbose is enabled)
+ * 
+ * @param message Information to display
+ */
+void printVerbose(std::string_view message) {
+    if (g_verbose) {
+        std::cout << "[VERBOSE] " << message << "\n";
+    }
+}
+
+/**
+ * Check if file exists
+ * 
+ * @param filepath Path to check
+ * @return true if file exists, false otherwise
+ */
+bool fileExists(const std::string& filepath) {
+    std::error_code ec;
+    return fs::exists(filepath, ec) && fs::is_regular_file(filepath, ec);
+}
+
+/**
+ * Check if file has .wasm extension
+ * 
+ * @param filepath Path to check
+ * @return true if file ends with .wasm, false otherwise
+ */
+bool hasWasmExtension(const std::string& filepath) {
+    return filepath.size() >= 5 && 
+           filepath.substr(filepath.size() - 5) == ".wasm";
+}
+
+/**
+ * Validate file before processing
+ * Checks existence and warns about extension.
+ * 
+ * @param filepath Path to validate
+ * @return true if file is valid for processing, false otherwise
+ */
+bool validateFile(const std::string& filepath) {
+    // Check file existence
+    if (!fileExists(filepath)) {
+        std::cerr << "Error: File not found: " << filepath << "\n";
+        return false;
+    }
+    
+    // Warn about extension (informational only)
+    if (!hasWasmExtension(filepath)) {
+        std::cerr << "Warning: File does not have .wasm extension: " << filepath << "\n";
+    }
+    
+    return true;
+}
+
 // ============================================================================
 // Sub-command Implementations
 // ============================================================================
@@ -131,43 +244,39 @@ void printSuccess(std::string_view command, std::string_view filename,
  * Parse sub-command implementation using WasmEdge C API
  * 
  * Demonstrates: Parser context lifecycle, AST module creation
+ * Uses RAII wrappers for automatic resource cleanup.
  * 
  * @param filename Path to the .wasm file to parse
  * @return Exit code (EXIT_OK or EXIT_RUNTIME_ERROR)
  */
 int cmdParse(const std::string& filename) {
-    // Resource pointers - initialized to nullptr for safe cleanup
-    WasmEdge_ParserContext* parserCtx = nullptr;
-    WasmEdge_ASTModuleContext* astModuleCtx = nullptr;
-    int exitCode = EXIT_OK;
-
-    // Step 1: Create the parser context
-    parserCtx = WasmEdge_ParserCreate(nullptr);
-    if (parserCtx == nullptr) {
+    printVerbose(std::string("WasmEdge version: ") + WasmEdge_VersionGet());
+    printVerbose(std::string("Processing file: ") + filename);
+    
+    // Step 1: Create the parser context (RAII managed)
+    printVerbose("Creating parser context...");
+    ParserPtr parserCtx(WasmEdge_ParserCreate(nullptr));
+    if (!parserCtx) {
         printContextError("PARSE", filename, "parser context");
         return EXIT_RUNTIME_ERROR;
     }
 
     // Step 2: Parse the WebAssembly file
-    WasmEdge_Result result = WasmEdge_ParserParseFromFile(parserCtx, &astModuleCtx, filename.c_str());
+    printVerbose("Parsing WebAssembly module...");
+    WasmEdge_ASTModuleContext* rawAstModule = nullptr;
+    WasmEdge_Result result = WasmEdge_ParserParseFromFile(parserCtx.get(), &rawAstModule, filename.c_str());
+    ASTModulePtr astModuleCtx(rawAstModule);  // Take ownership immediately
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("PARSE", filename, "FAILED", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-    } else {
-        // Success
-        printSuccess("PARSE", filename, "SUCCESS");
+        return EXIT_RUNTIME_ERROR;
     }
 
-    // Cleanup resources (always executed)
-    if (astModuleCtx != nullptr) {
-        WasmEdge_ASTModuleDelete(astModuleCtx);
-    }
-    if (parserCtx != nullptr) {
-        WasmEdge_ParserDelete(parserCtx);
-    }
-
-    return exitCode;
+    // Success
+    printVerbose("Parse completed successfully.");
+    printSuccess("PARSE", filename, "SUCCESS");
+    return EXIT_OK;
+    // RAII: parserCtx and astModuleCtx automatically cleaned up
 }
 
 /**
@@ -175,65 +284,56 @@ int cmdParse(const std::string& filename) {
  * 
  * Pipeline: Parse -> Validate
  * Demonstrates: Multi-context lifecycle, semantic validation
+ * Uses RAII wrappers for automatic resource cleanup.
  * 
  * @param filename Path to the .wasm file to validate
  * @return Exit code (EXIT_OK or EXIT_RUNTIME_ERROR)
  */
 int cmdValidate(const std::string& filename) {
-    // Resource pointers - initialized to nullptr for safe cleanup
-    WasmEdge_ParserContext* parserCtx = nullptr;
-    WasmEdge_ASTModuleContext* astModuleCtx = nullptr;
-    WasmEdge_ValidatorContext* validatorCtx = nullptr;
-    int exitCode = EXIT_OK;
-
-    // Step 1: Create the parser context
-    parserCtx = WasmEdge_ParserCreate(nullptr);
-    if (parserCtx == nullptr) {
+    printVerbose(std::string("WasmEdge version: ") + WasmEdge_VersionGet());
+    printVerbose(std::string("Processing file: ") + filename);
+    
+    // Step 1: Create the parser context (RAII managed)
+    printVerbose("Creating parser context...");
+    ParserPtr parserCtx(WasmEdge_ParserCreate(nullptr));
+    if (!parserCtx) {
         printContextError("VALIDATE", filename, "parser context");
         return EXIT_RUNTIME_ERROR;
     }
 
     // Step 2: Parse the WebAssembly file
-    WasmEdge_Result result = WasmEdge_ParserParseFromFile(parserCtx, &astModuleCtx, filename.c_str());
+    printVerbose("Parsing WebAssembly module...");
+    WasmEdge_ASTModuleContext* rawAstModule = nullptr;
+    WasmEdge_Result result = WasmEdge_ParserParseFromFile(parserCtx.get(), &rawAstModule, filename.c_str());
+    ASTModulePtr astModuleCtx(rawAstModule);  // Take ownership immediately
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("VALIDATE", filename, "FAILED (Parse Error)", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-        goto cleanup;
+        return EXIT_RUNTIME_ERROR;
     }
 
-    // Step 3: Create the validator context
-    validatorCtx = WasmEdge_ValidatorCreate(nullptr);
-    if (validatorCtx == nullptr) {
+    // Step 3: Create the validator context (RAII managed)
+    printVerbose("Creating validator context...");
+    ValidatorPtr validatorCtx(WasmEdge_ValidatorCreate(nullptr));
+    if (!validatorCtx) {
         printContextError("VALIDATE", filename, "validator context");
-        exitCode = EXIT_RUNTIME_ERROR;
-        goto cleanup;
+        return EXIT_RUNTIME_ERROR;
     }
 
     // Step 4: Validate the AST module
-    result = WasmEdge_ValidatorValidate(validatorCtx, astModuleCtx);
+    printVerbose("Validating WebAssembly module...");
+    result = WasmEdge_ValidatorValidate(validatorCtx.get(), astModuleCtx.get());
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("VALIDATE", filename, "INVALID", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-    } else {
-        // Success
-        printSuccess("VALIDATE", filename, "VALID");
+        return EXIT_RUNTIME_ERROR;
     }
 
-cleanup:
-    // Cleanup resources (always executed, order matters)
-    if (validatorCtx != nullptr) {
-        WasmEdge_ValidatorDelete(validatorCtx);
-    }
-    if (astModuleCtx != nullptr) {
-        WasmEdge_ASTModuleDelete(astModuleCtx);
-    }
-    if (parserCtx != nullptr) {
-        WasmEdge_ParserDelete(parserCtx);
-    }
-
-    return exitCode;
+    // Success
+    printVerbose("Validation completed successfully.");
+    printSuccess("VALIDATE", filename, "VALID");
+    return EXIT_OK;
+    // RAII: All contexts automatically cleaned up
 }
 
 /**
@@ -241,59 +341,56 @@ cleanup:
  * 
  * Pipeline: VM Create -> Load -> Validate -> Instantiate
  * Demonstrates: VM lifecycle, streamlined module loading
+ * Uses RAII wrappers for automatic resource cleanup.
  * Does not execute any functions - only creates a ready VM instance.
  * 
  * @param filename Path to the .wasm file to instantiate
  * @return Exit code (EXIT_OK or EXIT_RUNTIME_ERROR)
  */
 int cmdInstantiate(const std::string& filename) {
-    // Resource pointer - initialized to nullptr for safe cleanup
-    WasmEdge_VMContext* vmCtx = nullptr;
-    int exitCode = EXIT_OK;
-
-    // Step 1: Create the VM context
-    vmCtx = WasmEdge_VMCreate(nullptr, nullptr);
-    if (vmCtx == nullptr) {
+    printVerbose(std::string("WasmEdge version: ") + WasmEdge_VersionGet());
+    printVerbose(std::string("Processing file: ") + filename);
+    
+    // Step 1: Create the VM context (RAII managed)
+    printVerbose("Creating VM context...");
+    VMPtr vmCtx(WasmEdge_VMCreate(nullptr, nullptr));
+    if (!vmCtx) {
         printContextError("INSTANTIATE", filename, "VM context");
         return EXIT_RUNTIME_ERROR;
     }
 
     // Step 2: Load the WebAssembly module from file
-    WasmEdge_Result result = WasmEdge_VMLoadWasmFromFile(vmCtx, filename.c_str());
+    printVerbose("Loading WebAssembly module...");
+    WasmEdge_Result result = WasmEdge_VMLoadWasmFromFile(vmCtx.get(), filename.c_str());
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("INSTANTIATE", filename, "FAILED (Load Error)", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-        goto cleanup;
+        return EXIT_RUNTIME_ERROR;
     }
 
     // Step 3: Validate the loaded module
-    result = WasmEdge_VMValidate(vmCtx);
+    printVerbose("Validating loaded module...");
+    result = WasmEdge_VMValidate(vmCtx.get());
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("INSTANTIATE", filename, "FAILED (Validation Error)", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-        goto cleanup;
+        return EXIT_RUNTIME_ERROR;
     }
 
     // Step 4: Instantiate the module
-    result = WasmEdge_VMInstantiate(vmCtx);
+    printVerbose("Instantiating module...");
+    result = WasmEdge_VMInstantiate(vmCtx.get());
 
     if (!WasmEdge_ResultOK(result)) {
         printWasmEdgeError("INSTANTIATE", filename, "FAILED (Instantiation Error)", result);
-        exitCode = EXIT_RUNTIME_ERROR;
-    } else {
-        // Success
-        printSuccess("INSTANTIATE", filename, "READY");
+        return EXIT_RUNTIME_ERROR;
     }
 
-cleanup:
-    // Cleanup resources (always executed)
-    if (vmCtx != nullptr) {
-        WasmEdge_VMDelete(vmCtx);
-    }
-
-    return exitCode;
+    // Success
+    printVerbose("Instantiation completed successfully.");
+    printSuccess("INSTANTIATE", filename, "READY");
+    return EXIT_OK;
+    // RAII: vmCtx automatically cleaned up
 }
 
 // ============================================================================
@@ -305,7 +402,7 @@ cleanup:
  * 
  * Exit codes:
  *   EXIT_OK (0)           - Success
- *   EXIT_CLI_ERROR (1)    - Invalid arguments, unknown command
+ *   EXIT_CLI_ERROR (1)    - Invalid arguments, unknown command, file not found
  *   EXIT_RUNTIME_ERROR (2) - WasmEdge runtime error
  */
 int main(int argc, char* argv[]) {
@@ -316,22 +413,42 @@ int main(int argc, char* argv[]) {
         return EXIT_CLI_ERROR;
     }
 
-    std::string_view arg1 = argv[1];
-
-    // Handle help option
-    if (arg1 == "-h" || arg1 == "--help") {
+    // Parse arguments - support options before command
+    int argIndex = 1;
+    
+    // Process options first
+    while (argIndex < argc) {
+        std::string_view arg = argv[argIndex];
+        
+        if (arg == "-h" || arg == "--help") {
+            printUsage();
+            return EXIT_OK;
+        }
+        
+        if (arg == "-v" || arg == "--version") {
+            printVersion();
+            return EXIT_OK;
+        }
+        
+        if (arg == "--verbose") {
+            g_verbose = true;
+            argIndex++;
+            continue;
+        }
+        
+        // Not an option, must be command
+        break;
+    }
+    
+    // Check if we have a command
+    if (argIndex >= argc) {
+        printCliError("No command specified.");
         printUsage();
-        return EXIT_OK;
+        return EXIT_CLI_ERROR;
     }
 
-    // Handle version option
-    if (arg1 == "-v" || arg1 == "--version") {
-        printVersion();
-        return EXIT_OK;
-    }
-
-    // From here, we expect a command
-    std::string_view command = arg1;
+    std::string_view command = argv[argIndex];
+    argIndex++;
 
     // Validate known commands
     if (command != "parse" && command != "validate" && command != "instantiate") {
@@ -341,13 +458,20 @@ int main(int argc, char* argv[]) {
     }
 
     // Check for file argument
-    if (argc < 3) {
+    if (argIndex >= argc) {
         printCliError(std::string("Missing file argument for '") + std::string(command) + "' command.");
         printUsage();
         return EXIT_CLI_ERROR;
     }
 
-    std::string filename = argv[2];
+    std::string filename = argv[argIndex];
+    
+    // Validate file before processing
+    if (!validateFile(filename)) {
+        return EXIT_CLI_ERROR;
+    }
+    
+    printVerbose("File validation passed.");
 
     // Route to the appropriate sub-command handler
     if (command == "parse") {
