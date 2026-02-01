@@ -3,6 +3,8 @@
  * 
  * Phase 1: CLI skeleton with argument parsing and sub-command routing
  * Phase 2: parse sub-command implementation using WasmEdge C API
+ * Phase 3: validate sub-command implementation using WasmEdge C API
+ * Phase 4: instantiate sub-command implementation using WasmEdge C API
  */
 
 #include <iostream>
@@ -120,30 +122,166 @@ int cmdParse(const std::string& filename) {
 }
 
 /**
- * Validate sub-command (stub - Phase 3)
+ * Validate sub-command implementation using WasmEdge C API
+ * 
+ * Pipeline: Parse -> Validate
  * 
  * @param filename Path to the .wasm file to validate
  * @return Exit code (0 for success, non-zero for failure)
  */
 int cmdValidate(const std::string& filename) {
+    // Step 1: Create the parser context
+    WasmEdge_ParserContext* parserCtx = WasmEdge_ParserCreate(nullptr);
+    if (parserCtx == nullptr) {
+        std::cerr << "[VALIDATE]\n"
+                  << "File   : " << filename << "\n"
+                  << "Result : FAILED\n"
+                  << "Error  : Failed to create parser context\n";
+        return EXIT_VALIDATE_ERROR;
+    }
+
+    // Step 2: Parse the WebAssembly file
+    WasmEdge_ASTModuleContext* astModuleCtx = nullptr;
+    WasmEdge_Result result = WasmEdge_ParserParseFromFile(parserCtx, &astModuleCtx, filename.c_str());
+
+    if (!WasmEdge_ResultOK(result)) {
+        uint32_t errorCode = WasmEdge_ResultGetCode(result);
+        const char* errorMessage = WasmEdge_ResultGetMessage(result);
+        
+        std::cerr << "[VALIDATE]\n"
+                  << "File   : " << filename << "\n"
+                  << "Result : FAILED (Parse Error)\n"
+                  << "Error  : [" << errorCode << "] " 
+                  << (errorMessage ? errorMessage : "Unknown error") << "\n";
+        
+        WasmEdge_ParserDelete(parserCtx);
+        return EXIT_VALIDATE_ERROR;
+    }
+
+    // Step 3: Create the validator context
+    WasmEdge_ValidatorContext* validatorCtx = WasmEdge_ValidatorCreate(nullptr);
+    if (validatorCtx == nullptr) {
+        std::cerr << "[VALIDATE]\n"
+                  << "File   : " << filename << "\n"
+                  << "Result : FAILED\n"
+                  << "Error  : Failed to create validator context\n";
+        
+        WasmEdge_ASTModuleDelete(astModuleCtx);
+        WasmEdge_ParserDelete(parserCtx);
+        return EXIT_VALIDATE_ERROR;
+    }
+
+    // Step 4: Validate the AST module
+    result = WasmEdge_ValidatorValidate(validatorCtx, astModuleCtx);
+
+    if (!WasmEdge_ResultOK(result)) {
+        uint32_t errorCode = WasmEdge_ResultGetCode(result);
+        const char* errorMessage = WasmEdge_ResultGetMessage(result);
+        
+        std::cerr << "[VALIDATE]\n"
+                  << "File   : " << filename << "\n"
+                  << "Result : INVALID\n"
+                  << "Error  : [" << errorCode << "] " 
+                  << (errorMessage ? errorMessage : "Unknown error") << "\n";
+        
+        WasmEdge_ValidatorDelete(validatorCtx);
+        WasmEdge_ASTModuleDelete(astModuleCtx);
+        WasmEdge_ParserDelete(parserCtx);
+        return EXIT_VALIDATE_ERROR;
+    }
+
+    // Success - print structured output
     std::cout << "[VALIDATE]\n"
               << "File   : " << filename << "\n"
-              << "Status : NOT IMPLEMENTED\n"
-              << "Note   : Validation will be implemented in Phase 3\n";
+              << "Result : VALID\n";
+
+    // Cleanup resources
+    WasmEdge_ValidatorDelete(validatorCtx);
+    WasmEdge_ASTModuleDelete(astModuleCtx);
+    WasmEdge_ParserDelete(parserCtx);
+
     return EXIT_SUCCESS_CODE;
 }
 
 /**
- * Instantiate sub-command (stub - Phase 4)
+ * Instantiate sub-command implementation using WasmEdge C API
+ * 
+ * Uses WasmEdge VM for streamlined load + instantiate workflow.
+ * Does not execute any functions - only creates a ready VM instance.
  * 
  * @param filename Path to the .wasm file to instantiate
  * @return Exit code (0 for success, non-zero for failure)
  */
 int cmdInstantiate(const std::string& filename) {
+    // Step 1: Create the VM context with default configuration
+    WasmEdge_VMContext* vmCtx = WasmEdge_VMCreate(nullptr, nullptr);
+    if (vmCtx == nullptr) {
+        std::cerr << "[INSTANTIATE]\n"
+                  << "File      : " << filename << "\n"
+                  << "VM Status : FAILED\n"
+                  << "Error     : Failed to create VM context\n";
+        return EXIT_INSTANTIATE_ERROR;
+    }
+
+    // Step 2: Load the WebAssembly module from file
+    WasmEdge_Result result = WasmEdge_VMLoadWasmFromFile(vmCtx, filename.c_str());
+
+    if (!WasmEdge_ResultOK(result)) {
+        uint32_t errorCode = WasmEdge_ResultGetCode(result);
+        const char* errorMessage = WasmEdge_ResultGetMessage(result);
+        
+        std::cerr << "[INSTANTIATE]\n"
+                  << "File      : " << filename << "\n"
+                  << "VM Status : FAILED (Load Error)\n"
+                  << "Error     : [" << errorCode << "] " 
+                  << (errorMessage ? errorMessage : "Unknown error") << "\n";
+        
+        WasmEdge_VMDelete(vmCtx);
+        return EXIT_INSTANTIATE_ERROR;
+    }
+
+    // Step 3: Validate the loaded module
+    result = WasmEdge_VMValidate(vmCtx);
+
+    if (!WasmEdge_ResultOK(result)) {
+        uint32_t errorCode = WasmEdge_ResultGetCode(result);
+        const char* errorMessage = WasmEdge_ResultGetMessage(result);
+        
+        std::cerr << "[INSTANTIATE]\n"
+                  << "File      : " << filename << "\n"
+                  << "VM Status : FAILED (Validation Error)\n"
+                  << "Error     : [" << errorCode << "] " 
+                  << (errorMessage ? errorMessage : "Unknown error") << "\n";
+        
+        WasmEdge_VMDelete(vmCtx);
+        return EXIT_INSTANTIATE_ERROR;
+    }
+
+    // Step 4: Instantiate the module
+    result = WasmEdge_VMInstantiate(vmCtx);
+
+    if (!WasmEdge_ResultOK(result)) {
+        uint32_t errorCode = WasmEdge_ResultGetCode(result);
+        const char* errorMessage = WasmEdge_ResultGetMessage(result);
+        
+        std::cerr << "[INSTANTIATE]\n"
+                  << "File      : " << filename << "\n"
+                  << "VM Status : FAILED (Instantiation Error)\n"
+                  << "Error     : [" << errorCode << "] " 
+                  << (errorMessage ? errorMessage : "Unknown error") << "\n";
+        
+        WasmEdge_VMDelete(vmCtx);
+        return EXIT_INSTANTIATE_ERROR;
+    }
+
+    // Success - print structured output
     std::cout << "[INSTANTIATE]\n"
-              << "File   : " << filename << "\n"
-              << "Status : NOT IMPLEMENTED\n"
-              << "Note   : Instantiation will be implemented in Phase 4\n";
+              << "File      : " << filename << "\n"
+              << "VM Status : READY\n";
+
+    // Cleanup resources
+    WasmEdge_VMDelete(vmCtx);
+
     return EXIT_SUCCESS_CODE;
 }
 
